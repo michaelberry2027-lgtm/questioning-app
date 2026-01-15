@@ -380,10 +380,7 @@ export default function Lindy() {
             <PinPad value={newPin} onChange={setNewPin} />
           </div>
 
-          <div className="mb-4">
-            <p className="text-sm font-semibold mb-1">Confirm New PIN</p>
-            <PinPad value={confirmPin} onChange={setConfirmPin} />
-          </div>
+        
 
           {pinChangeError && (
             <p className="text-sm text-red-500 mb-2">{pinChangeError}</p>
