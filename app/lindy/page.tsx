@@ -37,15 +37,21 @@ export default function Lindy() {
   const [pinError, setPinError] = useState("");
   const [pinChecking, setPinChecking] = useState(false);
 
-  // Change PIN modal state
-  const [showPinModal, setShowPinModal] = useState(false);
-  const [currentPin, setCurrentPin] = useState("");
-  const [newPin, setNewPin] = useState("");
-  const [confirmPin, setConfirmPin] = useState("");
-  const [pinChangeError, setPinChangeError] = useState("");
-  const [pinSaving, setPinSaving] = useState(false);
+  // Follow-up state
+  const [followUpText, setFollowUpText] = useState("");
+  const [followUpError, setFollowUpError] = useState("");
+  const [followUpSaving, setFollowUpSaving] = useState(false);
 
-  const load = async () => {
+  // Account information modal state
+  const [showAccountInfo, setShowAccountInfo] = useState(false);
+  const [accountInfoLoading, setAccountInfoLoading] = useState(false);
+  const [phoneType, setPhoneType] = useState<"iphone" | "other">("iphone");
+  const [notifEmail, setNotifEmail] = useState("");
+  const [accountSaveError, setAccountSaveError] = useState("");
+  const [accountSaving, setAccountSaving] = useState(false);
+
+  // Load questions for Lindy
+  const loadQuestions = async () => {
     const { data, error } = await supabase
       .from("questions")
       .select("id,assigned_to,title,description,status,answer_text")
@@ -56,13 +62,49 @@ export default function Lindy() {
     if (!error && data) setQuestions(data as Q[]);
   };
 
-  // Only load questions after unlock
+  // After unlock: load account info + questions
   useEffect(() => {
-    if (unlocked) {
-      load();
-    }
+    if (!unlocked) return;
+
+    const initAfterUnlock = async () => {
+      setAccountInfoLoading(true);
+      setAccountSaveError("");
+
+      const { data, error } = await supabase
+        .from("user_settings")
+        .select("phone_type, notification_email, onboarding_complete")
+        .eq("person", PERSON)
+        .maybeSingle();
+
+      if (!error && data) {
+        if (data.phone_type === "iphone" || data.phone_type === "other") {
+          setPhoneType(data.phone_type);
+        } else {
+          setPhoneType("iphone");
+        }
+
+        setNotifEmail(data.notification_email ?? "");
+
+        if (!data.onboarding_complete) {
+          setShowAccountInfo(true);
+        }
+      } else {
+        // No row yet → show modal
+        setPhoneType("iphone");
+        setNotifEmail("");
+        setShowAccountInfo(true);
+      }
+
+      setAccountInfoLoading(false);
+
+      // Load questions after checking settings
+      await loadQuestions();
+    };
+
+    initAfterUnlock();
   }, [unlocked]);
 
+  // Submit new question
   const submit = async () => {
     if (!form.title.trim() || !form.description.trim()) return;
 
@@ -75,9 +117,10 @@ export default function Lindy() {
 
     setShowAsk(false);
     setForm({ assigned_to: "eben", title: "", description: "" });
-    load();
+    loadQuestions();
   };
 
+  // Archive question
   const archive = async (id: string) => {
     await supabase
       .from("questions")
@@ -85,7 +128,9 @@ export default function Lindy() {
       .eq("id", id);
 
     setActive(null);
-    load();
+    setFollowUpText("");
+    setFollowUpError("");
+    loadQuestions();
   };
 
   const unanswered = questions.filter((q) => q.status === "pending");
@@ -114,50 +159,83 @@ export default function Lindy() {
     setPinChecking(false);
   };
 
-  // Change PIN handler
-  const handleChangePin = async () => {
-    if (
-      currentPin.length !== 4 ||
-      newPin.length !== 4 ||
-      confirmPin.length !== 4
-    ) {
-      setPinChangeError("All PIN fields must be 4 digits.");
-      return;
-    }
-    if (newPin !== confirmPin) {
-      setPinChangeError("New PIN entries do not match.");
+  // Follow-up handler: send follow-up + auto-archive original
+  const handleSendFollowUp = async () => {
+    if (!active) return;
+
+    if (!followUpText.trim()) {
+      setFollowUpError("Please type your follow-up before sending.");
       return;
     }
 
-    setPinChangeError("");
-    setPinSaving(true);
+    setFollowUpError("");
+    setFollowUpSaving(true);
 
-    const { data, error } = await supabase
-      .from("pins")
-      .select("pin")
-      .eq("person", PERSON)
-      .single();
+    const followUpTitle = `Follow Up: ${active.title}`;
 
-    if (error || !data || data.pin !== currentPin) {
-      setPinChangeError("Current PIN is incorrect.");
-      setPinSaving(false);
+    // 1) Insert new follow-up question
+    const { error: insertError } = await supabase.from("questions").insert({
+      assigned_to: active.assigned_to,
+      submitted_by,
+      title: followUpTitle,
+      description: followUpText.trim(),
+    });
+
+    if (insertError) {
+      console.error(insertError);
+      setFollowUpError("Could not send follow-up. Please try again.");
+      setFollowUpSaving(false);
       return;
     }
 
-    const { error: updateError } = await supabase
-      .from("pins")
-      .upsert({ person: PERSON, pin: newPin });
+    // 2) Archive the original
+    const { error: archiveError } = await supabase
+      .from("questions")
+      .update({ archived_by_submitter: true })
+      .eq("id", active.id);
 
-    if (updateError) {
-      setPinChangeError("Could not update PIN. Please try again.");
-    } else {
-      setShowPinModal(false);
-      setCurrentPin("");
-      setNewPin("");
-      setConfirmPin("");
+    if (archiveError) {
+      console.error(archiveError);
+      setFollowUpError(
+        "Follow-up sent, but could not archive the original yet."
+      );
+      // Still continue; follow-up exists.
     }
 
-    setPinSaving(false);
+    setActive(null);
+    setFollowUpText("");
+    setFollowUpSaving(false);
+    loadQuestions();
+  };
+
+  // Save Account Information from modal
+  const handleSaveAccountInfo = async () => {
+    if (phoneType === "other" && !notifEmail.trim()) {
+      setAccountSaveError("Please enter an email for notifications.");
+      return;
+    }
+
+    setAccountSaving(true);
+    setAccountSaveError("");
+
+    const { error } = await supabase.from("user_settings").upsert({
+      person: PERSON,
+      phone_type: phoneType,
+      notification_email: phoneType === "other" ? notifEmail.trim() : null,
+      onboarding_complete: true,
+    });
+
+    if (error) {
+      console.error(error);
+      setAccountSaveError(
+        "Could not save account information. Please try again."
+      );
+      setAccountSaving(false);
+      return;
+    }
+
+    setShowAccountInfo(false);
+    setAccountSaving(false);
   };
 
   // Locked view
@@ -256,10 +334,14 @@ export default function Lindy() {
           description={`Assigned to: ${q.assigned_to}`}
           footer={
             <button
-              className="w-full rounded-xl bg-black text-white px-4 py-3 text-base"
-              onClick={() => setActive(q)}
+              className="w-full rounded-xl bg-black text白 px-4 py-3 text-base"
+              onClick={() => {
+                setActive(q);
+                setFollowUpText("");
+                setFollowUpError("");
+              }}
             >
-              View response
+              View response / Follow up
             </button>
           }
         />
@@ -267,24 +349,14 @@ export default function Lindy() {
 
       <div className="mt-6 flex flex-col gap-2">
         <a href="/lindy/archived">
-          <button className="w-full rounded-xl bg-white text-black border border-black px-4 py-3 text-base">
+          <button className="w-full rounded-xl bg白 text黑 border border黑 px-4 py-3 text-base">
             Archived
           </button>
         </a>
 
-        {/* Change PIN button */}
-        <button
-          className="text-xs underline self-end"
-          onClick={() => {
-            setShowPinModal(true);
-            setCurrentPin("");
-            setNewPin("");
-            setConfirmPin("");
-            setPinChangeError("");
-          }}
-        >
-          Change PIN
-        </button>
+        <a href="/lindy/settings" className="text-xs underline self-end">
+          Manage Settings
+        </a>
       </div>
 
       {/* Ask modal */}
@@ -323,7 +395,9 @@ export default function Lindy() {
           <textarea
             className="w-full border rounded-xl p-3 mt-1 min-h-[120px]"
             value={form.description}
-            onChange={(e) => setForm({ ...form, description: e.target.value })}
+            onChange={(e) =>
+              setForm({ ...form, description: e.target.value })
+            }
             placeholder="Description"
           />
 
@@ -336,65 +410,140 @@ export default function Lindy() {
         </Modal>
       ) : null}
 
-      {/* View response / archive modal */}
+      {/* View response / follow-up / archive modal */}
       {active ? (
-        <Modal onClose={() => setActive(null)}>
+        <Modal
+          onClose={() => {
+            setActive(null);
+            setFollowUpText("");
+            setFollowUpError("");
+          }}
+        >
           <h3 className="text-lg font-semibold mb-2">Response</h3>
+
           <div className="text-sm text-gray-700 mb-3">
             <div className="font-semibold">{active.title}</div>
           </div>
 
-          <div className="bg-gray-100 rounded-xl p-3 whitespace-pre-wrap">
+          <div className="bg-gray-100 rounded-xl p-3 whitespace-pre-wrap mb-3">
             {active.answer_text ?? ""}
           </div>
 
-          <button
-            className="mt-3 w-full rounded-xl bg-black text-white px-4 py-3 text-base"
-            onClick={() => archive(active.id)}
-          >
-            Archive
-          </button>
+          <label className="text-sm font-semibold block mb-1">
+            Follow-up question (optional)
+          </label>
+          <textarea
+            className="w-full border rounded-xl p-3 min-h-[100px]"
+            placeholder="Type your follow-up here..."
+            value={followUpText}
+            onChange={(e) => setFollowUpText(e.target.value)}
+          />
+
+          {followUpError && (
+            <p className="text-sm text-red-500 mt-2">{followUpError}</p>
+          )}
+
+          <div className="mt-3 flex flex-col gap-2">
+            <button
+              className="w-full rounded-xl bg-black text-white px-4 py-3 text-base disabled:opacity-60"
+              onClick={handleSendFollowUp}
+              disabled={followUpSaving}
+            >
+              {followUpSaving ? "Sending..." : "Send Follow-Up (and archive)"}
+            </button>
+
+            <button
+              className="w-full rounded-xl bg-white text-black border border-black px-4 py-3 text-base"
+              onClick={() => archive(active.id)}
+            >
+              Archive without follow-up
+            </button>
+          </div>
         </Modal>
       ) : null}
 
-      {/* Change PIN modal */}
-      {showPinModal ? (
-        <Modal onClose={() => setShowPinModal(false)}>
+      {/* One-time Account Information modal */}
+      {showAccountInfo && (
+        <Modal onClose={() => setShowAccountInfo(false)}>
           <h3
             className={`${cherryBomb.className} text-xl mb-3 text-black text-center`}
           >
-            Change PIN
+            Account Information
           </h3>
 
-          <p className="text-sm text-gray-700 mb-2">
-            Enter your current PIN and your new 4-digit PIN twice.
+          <p className="text-sm text-gray-700 mb-3">
+            Please answer the following questions to ensure your account is set
+            up properly.
           </p>
 
-          <div className="mb-4">
-            <p className="text-sm font-semibold mb-1">Current PIN</p>
-            <PinPad value={currentPin} onChange={setCurrentPin} />
-          </div>
+          {accountInfoLoading ? (
+            <div className="text-sm text-gray-600">Loading...</div>
+          ) : (
+            <>
+              <label className="text-sm font-semibold block mb-2">
+                What type of phone do you have?
+              </label>
 
-          <div className="mb-4">
-            <p className="text-sm font-semibold mb-1">New PIN</p>
-            <PinPad value={newPin} onChange={setNewPin} />
-          </div>
+              <div className="flex gap-4 text-sm mb-3">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="phoneTypeInitial"
+                    value="iphone"
+                    checked={phoneType === "iphone"}
+                    onChange={() => setPhoneType("iphone")}
+                  />
+                  iPhone
+                </label>
 
-        
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="phoneTypeInitial"
+                    value="other"
+                    checked={phoneType === "other"}
+                    onChange={() => setPhoneType("other")}
+                  />
+                  Other
+                </label>
+              </div>
 
-          {pinChangeError && (
-            <p className="text-sm text-red-500 mb-2">{pinChangeError}</p>
+              {phoneType === "iphone" ? (
+                <p className="text-sm text-gray-700 mb-3">
+                  You will receive push notifications from the app when you have
+                  a new question or answer. Please add the program to your home
+                  screen as a web app so it can work properly.
+                </p>
+              ) : (
+                <div className="mb-3">
+                  <label className="text-sm font-semibold block">
+                    What email would you like to receive notifications?
+                  </label>
+                  <input
+                    type="email"
+                    className="w-full border rounded-xl p-3 mt-1"
+                    value={notifEmail}
+                    onChange={(e) => setNotifEmail(e.target.value)}
+                    placeholder="you@example.com"
+                  />
+                </div>
+              )}
+
+              {accountSaveError && (
+                <p className="text-sm text-red-500 mt-2">{accountSaveError}</p>
+              )}
+
+              <button
+                className="mt-4 w-full rounded-xl bg-black text-white px-4 py-3 text-base disabled:opacity-60"
+                onClick={handleSaveAccountInfo}
+                disabled={accountSaving}
+              >
+                {accountSaving ? "Saving..." : "Save and Continue"}
+              </button>
+            </>
           )}
-
-          <button
-            className="mt-1 w-full rounded-xl bg-black text-white px-4 py-3 text-base disabled:opacity-60"
-            onClick={handleChangePin}
-            disabled={pinSaving}
-          >
-            {pinSaving ? "Saving..." : "Save PIN"}
-          </button>
         </Modal>
-      ) : null}
+      )}
     </main>
   );
 }
